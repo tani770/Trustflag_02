@@ -1,0 +1,37 @@
+version: "1.0"
+window_rules:
+  - id: "BURST_LOW_EFFORT"
+    description: "More than 3 low-effort PRs within a 60-minute sliding window."
+    window_minutes: 60
+    min_event_count: 3
+    conditions:
+      - signal: "churn_per_file"
+        operator: "lt"
+        threshold: 3.0
+      - signal: "body_length"
+        operator: "lt"
+        threshold: 20.0
+    action: "FLAG_SPAM"
+
+  - id: "FAST_MERGE_CHURN_ZERO"
+    description: "Merged instantly with single commit and low quality score."
+    window_minutes: 1440
+    min_event_count: 1
+    conditions:
+      - signal: "duration_seconds"
+        operator: "lt"
+        threshold: 60.0
+      - signal: "score"
+        operator: "lt"
+        threshold: 0.25
+    action: "FLAG_SUSPICIOUS"
+
+  - id: "ASYMPTOTIC_INEFFICIENCY_REGRESSION"
+    description: "Introduces nested loops O(N^2) or higher causing algorithmic regression."
+    window_minutes: 1440
+    min_event_count: 1
+    conditions:
+      - signal: "time_complexity"
+        operator: "gte"
+        threshold: 2.0
+    action: "FLAG_COMPLEXITY_REGRESSION"
