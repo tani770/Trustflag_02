@@ -2,23 +2,24 @@ import os
 import sys
 import json
 import asyncio
+import subprocess
 import httpx
 
-from signals import extract_signals_for_fact
+from signals import extract_signals_for_fact, compute_ast_complexity
 from scoring import calculate_quality_score
 from rules import load_rules, check_operator
 from bot import post_pr_audit_comment
 
 async def run_ci_gate():
     print("\n" + "=" * 60)
-    print("TRUSTFLAG AUTONOMOUS PR AUDIT RUNNER")
+    print("TRUSTFLAG AUTONOMOUS PR AUDIT RUNNER (DISK AST ENGINE)")
     print("=" * 60)
 
     event_path = os.getenv("GITHUB_EVENT_PATH")
     github_token = os.getenv("GITHUB_TOKEN")
-    
+
     if not event_path or not os.path.exists(event_path):
-        print("[ERROR] GITHUB_EVENT_PATH not found. Running in mock CI mode.")
+        print("[ERROR] GITHUB_EVENT_PATH not found.")
         sys.exit(1)
 
     with open(event_path, "r") as f:
@@ -32,15 +33,39 @@ async def run_ci_gate():
     repo_name = event_payload["repository"]["full_name"]
     pr_number = pr_data["number"]
     author = pr_data["user"]["login"]
-    diff_url = pr_data["diff_url"]
+    base_ref = pr_data["base"]["ref"]  # usually 'main'
 
     print(f"[*] Auditing PR #{pr_number} by @{author} on {repo_name}")
 
-    headers = {"Authorization": f"Bearer {github_token}"} if github_token else {}
-    async with httpx.AsyncClient() as client:
-        diff_resp = await client.get(diff_url, headers=headers)
-        raw_patch = diff_resp.text if diff_resp.status_code == 200 else ""
+    # 1. Detect all modified/added Python files on disk via git
+    try:
+        changed_files_proc = subprocess.run(
+            ["git", "diff", "--name-only", f"origin/{base_ref}...HEAD"],
+            capture_output=True, text=True, check=True
+        )
+        changed_files = [f.strip() for f in changed_files_proc.stdout.splitlines() if f.strip().endswith(".py")]
+    except Exception as e:
+        print(f"[WARN] Git diff command failed ({e}). Scanning repository for py files...")
+        changed_files = [f for f in os.listdir(".") if f.endswith(".py") and not f.startswith(("test_", "action_runner", "bot", "collector", "rules", "signals", "scoring", "api"))]
 
+    print(f"[+] Identified modified Python files to audit: {changed_files}")
+
+    # 2. Read file contents directly from disk and find maximum complexity
+    max_time_complexity = 0.0
+    max_space_complexity = 0.0
+    combined_code = []
+
+    for file_path in changed_files:
+        if os.path.exists(file_path):
+            with open(file_path, "r", encoding="utf-8", errors="ignore") as fp:
+                content = fp.read()
+                combined_code.append(content)
+                t_order, s_order = compute_ast_complexity(content)
+                print(f"  • Scanned '{file_path}' -> Time: O(N^{int(t_order)}), Space: O(N^{int(s_order)})")
+                max_time_complexity = max(max_time_complexity, t_order)
+                max_space_complexity = max(max_space_complexity, s_order)
+
+    # 3. Construct Fact
     fact = {
         "id": f"{repo_name}#{pr_number}",
         "author": author,
@@ -51,29 +76,30 @@ async def run_ci_gate():
         "additions": pr_data.get("additions", 0),
         "deletions": pr_data.get("deletions", 0),
         "changed_files": pr_data.get("changed_files", 0),
-        "patch": raw_patch
+        "patch": "\n".join(combined_code)
     }
 
-    # 1. Extract Signals
+    # 4. Extract Signals & Quality Score
     signals = extract_signals_for_fact(fact)
-    score = calculate_quality_score(signals)
+    # Overwrite with true disk AST analysis
+    signals["time_complexity"] = max_time_complexity
+    signals["space_complexity"] = max_space_complexity
 
-    # FIX: Inject computed score directly into signals so rules evaluate against it
+    score = calculate_quality_score(signals)
     signals["score"] = score
 
-    print("\n--- Extracted PR Metrics ---")
-    print(f" • Time Complexity   : O(N^{int(signals.get('time_complexity', 0))})")
-    print(f" • Space Complexity  : O(N^{int(signals.get('space_complexity', 0))})")
+    print("\n--- Final Evaluated PR Metrics ---")
+    print(f" • Time Complexity   : O(N^{int(signals['time_complexity'])})")
+    print(f" • Space Complexity  : O(N^{int(signals['space_complexity'])})")
     print(f" • Diff Churn / File : {signals.get('churn_per_file', 0)} lines")
     print(f" • Title Entropy     : {signals.get('title_entropy', 0):.2f} bits")
     print(f" • Quality Score     : {score}")
 
-    # 2. Evaluate Rules
+    # 5. Evaluate Rules from rules.yaml
     rules = load_rules("rules.yaml")
     triggered_violations = []
 
     for rule in rules:
-        # Skip post-merge rules for unmerged PRs (duration_seconds < 0 means not merged)
         if any(c["signal"] == "duration_seconds" for c in rule["conditions"]) and signals.get("duration_seconds", -1.0) < 0:
             continue
 
@@ -90,7 +116,7 @@ async def run_ci_gate():
                 "flag": rule["action"]
             })
 
-    # 3. Post PR Comment
+    # 6. Post Audit Comment to PR Thread
     async with httpx.AsyncClient() as client:
         await post_pr_audit_comment(
             repo=repo_name,
@@ -104,12 +130,12 @@ async def run_ci_gate():
             client=client
         )
 
-    # 4. CI Verdict
+    # 7. CI Pass / Fail Gate
     if triggered_violations:
         print(f"\n[❌ GATE REJECTED] Found {len(triggered_violations)} violation(s):")
         for v in triggered_violations:
             print(f"   - {v['rule_id']} ({v['flag']})")
-        print("\nBlocking PR merge due to quality/efficiency regression.")
+        print("\nBlocking PR merge due to O(N^2)+ complexity regression.")
         sys.exit(1)
     else:
         print("\n[✅ GATE PASSED] Code meets complexity and quality thresholds.")
