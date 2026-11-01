@@ -33,11 +33,11 @@ async def run_ci_gate():
     repo_name = event_payload["repository"]["full_name"]
     pr_number = pr_data["number"]
     author = pr_data["user"]["login"]
-    base_ref = pr_data["base"]["ref"]  # usually 'main'
+    base_ref = pr_data["base"]["ref"]
 
     print(f"[*] Auditing PR #{pr_number} by @{author} on {repo_name}")
 
-    # 1. Detect all modified/added Python files on disk via git
+    # 1. Identify changed Python files via git
     try:
         changed_files_proc = subprocess.run(
             ["git", "diff", "--name-only", f"origin/{base_ref}...HEAD"],
@@ -45,12 +45,11 @@ async def run_ci_gate():
         )
         changed_files = [f.strip() for f in changed_files_proc.stdout.splitlines() if f.strip().endswith(".py")]
     except Exception as e:
-        print(f"[WARN] Git diff command failed ({e}). Scanning repository for py files...")
         changed_files = [f for f in os.listdir(".") if f.endswith(".py") and not f.startswith(("test_", "action_runner", "bot", "collector", "rules", "signals", "scoring", "api"))]
 
     print(f"[+] Identified modified Python files to audit: {changed_files}")
 
-    # 2. Read file contents directly from disk and find maximum complexity
+    # 2. Parse AST of changed files on disk
     max_time_complexity = 0.0
     max_space_complexity = 0.0
     combined_code = []
@@ -79,9 +78,8 @@ async def run_ci_gate():
         "patch": "\n".join(combined_code)
     }
 
-    # 4. Extract Signals & Quality Score
+    # 4. Extract Signals
     signals = extract_signals_for_fact(fact)
-    # Overwrite with true disk AST analysis
     signals["time_complexity"] = max_time_complexity
     signals["space_complexity"] = max_space_complexity
 
@@ -95,11 +93,17 @@ async def run_ci_gate():
     print(f" • Title Entropy     : {signals.get('title_entropy', 0):.2f} bits")
     print(f" • Quality Score     : {score}")
 
-    # 5. Evaluate Rules from rules.yaml
+    # 5. Evaluate Rules
     rules = load_rules("rules.yaml")
     triggered_violations = []
 
     for rule in rules:
+        # FIX 1: Single-PR CI gate must only evaluate single-event rules (min_event_count == 1)
+        # Multi-event burst rules (min_event_count > 1) require historical database history
+        if rule.get("min_event_count", 1) > 1:
+            continue
+
+        # FIX 2: Skip post-merge rules on unmerged open PRs
         if any(c["signal"] == "duration_seconds" for c in rule["conditions"]) and signals.get("duration_seconds", -1.0) < 0:
             continue
 
@@ -135,7 +139,7 @@ async def run_ci_gate():
         print(f"\n[❌ GATE REJECTED] Found {len(triggered_violations)} violation(s):")
         for v in triggered_violations:
             print(f"   - {v['rule_id']} ({v['flag']})")
-        print("\nBlocking PR merge due to O(N^2)+ complexity regression.")
+        print("\nBlocking PR merge due to quality/efficiency regression.")
         sys.exit(1)
     else:
         print("\n[✅ GATE PASSED] Code meets complexity and quality thresholds.")
