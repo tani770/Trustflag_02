@@ -1,11 +1,11 @@
-version: "2.0"
+version: "3.0"
 window_rules:
-  - id: "ASYMPTOTIC_INEFFICIENCY_REGRESSION"
-    description: "Code introduces nested iterations, hidden O(N^2) in-loop searches, or artificial sleep stalls."
+  - id: "REQUIRE_100_PERCENT_ACCURACY"
+    description: "Code must be 100% accurate. Any failed assertion, syntax error, or wrong output triggers immediate rejection."
     window_minutes: 1440
     min_event_count: 1
     conditions:
-      - signal: "time_complexity"
-        operator: "gte"
-        threshold: 2.0
-    action: "FLAG_COMPLEXITY_REGRESSION"
+      - signal: "score"
+        operator: "lt"
+        threshold: 1.0
+    action: "FLAG_INACCURATE_CODE"

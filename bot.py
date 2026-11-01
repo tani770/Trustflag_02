@@ -9,42 +9,44 @@ def get_auth_headers(token: str) -> Dict[str, str]:
     return {
         "Accept": "application/vnd.github.v3+json",
         "Authorization": f"{auth_prefix} {clean_token}",
-        "User-Agent": "TrustFlag-Bot/2.0"
+        "User-Agent": "TrustFlag-Bot/3.0"
     }
 
-async def post_github_status(repo: str, sha: str, state: str, description: str, target_url: str, token: str, client: httpx.AsyncClient) -> None:
-    if not token or not sha:
-        return
-    url = f"{GITHUB_API_BASE}/repos/{repo}/statuses/{sha}"
-    payload = {
-        "state": state,
-        "target_url": target_url,
-        "description": description[:140],
-        "context": "TrustFlag / Code Quality & Efficiency"
-    }
-    await client.post(url, headers=get_auth_headers(token), json=payload)
-
-async def post_pr_audit_comment(repo: str, pr_number: int, author: str, score: float, decisions: List[Dict[str, Any]], signals: Dict[str, float], appeal_url: str, token: str, client: httpx.AsyncClient) -> None:
+async def post_pr_audit_comment(
+    repo: str,
+    pr_number: int,
+    author: str,
+    score: float,
+    decisions: List[Dict[str, Any]],
+    signals: Dict[str, float],
+    appeal_url: str,
+    token: str,
+    client: httpx.AsyncClient
+) -> None:
     if not token:
         return
-    is_flagged = len(decisions) > 0
-    badge = "❌ **AUDIT FAILED (CHANGES REQUESTED)**" if is_flagged else "✅ **AUDIT PASSED**"
-    comment_body = f"""### {badge}
-**Contributor:** @{author} | **Quality Score:** `{score}` / 1.00
 
-#### Signal Analysis
-| Signal Metric | Value | Reference Threshold |
+    accuracy_pct = signals.get("accuracy", 0.0) * 100.0
+    is_100_percent = accuracy_pct >= 100.0 and len(decisions) == 0
+
+    badge = "✅ **AUDIT PASSED (100% ACCURATE)**" if is_100_percent else "❌ **AUDIT FAILED (ACCURACY DEFICIT DETECTED)**"
+
+    comment_body = f"""### {badge}
+**Contributor:** @{author} | **Functional Accuracy:** `{accuracy_pct:.1f}%`
+
+#### Accuracy Verification
+| Verification Check | Result | Requirement |
 | :--- | :--- | :--- |
-| **Time Complexity** | `O(N^{int(signals.get('time_complexity', 0))})` | `< O(N^2)` |
-| **Space Complexity** | `O(N^{int(signals.get('space_complexity', 0))})` | In-loop allocations |
-| **Diff Churn per File** | `{signals.get('churn_per_file', 0)} lines` | Quality baseline |
-| **Commit/Title Entropy** | `{signals.get('title_entropy', 0):.2f} bits` | `> 2.50` (Anti-bot) |
+| **Code Accuracy Score** | `{accuracy_pct:.1f}%` | **Must be 100.0%** |
+| **Syntax & Compilation** | {'✅ PASS' if signals.get('syntax_valid', 0.0) == 1.0 else '❌ FAIL'} | Zero syntax errors |
+| **Test Assertions** | {int(signals.get('tests_passed', 0))}/{int(signals.get('tests_total', 0))} Passed | 100% Pass Rate |
 """
-    if is_flagged:
-        comment_body += "\n#### ⚠️ Rule Violations Triggered:\n"
+
+    if not is_100_percent:
+        comment_body += "\n#### ⚠️ Rejection Reason:\n"
         for d in decisions:
             comment_body += f"- **Rule:** `{d['rule_id']}` | **Action:** `{d['flag']}`\n"
-        comment_body += f"\n> **Dispute this decision:** You can submit an explanation via the [Auditor Appeal Desk]({appeal_url}).\n"
+        comment_body += f"\n> **Resolution:** Fix the failing test cases or inaccurate calculations to reach 100% accuracy before merging.\n"
 
     url = f"{GITHUB_API_BASE}/repos/{repo}/issues/{pr_number}/comments"
     await client.post(url, headers=get_auth_headers(token), json={"body": comment_body})

@@ -5,15 +5,14 @@ import asyncio
 import subprocess
 import httpx
 
-from signals import extract_signals_for_fact, compute_ast_complexity
 from scoring import calculate_quality_score
 from rules import load_rules, check_operator
 from bot import post_pr_audit_comment
 
-async def run_ci_gate():
-    print("\n" + "=" * 60)
-    print("TRUSTFLAG AUTONOMOUS PR AUDIT RUNNER")
-    print("=" * 60)
+async def run_ci_gate() -> None:
+    print("\n" + "=" * 65)
+    print("TRUSTFLAG AUTONOMOUS PR AUDIT RUNNER (ACCURACY ENGINE)")
+    print("=" * 65)
 
     event_path = os.getenv("GITHUB_EVENT_PATH")
     github_token = os.getenv("GITHUB_TOKEN", "").strip()
@@ -37,7 +36,7 @@ async def run_ci_gate():
 
     print(f"[*] Auditing PR #{pr_number} by @{author} on {repo_name}")
 
-    # 1. Inspect modified Python files directly on disk
+    # 1. Identify changed Python files
     try:
         changed_proc = subprocess.run(
             ["git", "diff", "--name-only", f"origin/{base_ref}...HEAD"],
@@ -47,51 +46,68 @@ async def run_ci_gate():
     except Exception:
         changed_files = [f for f in os.listdir(".") if f.endswith(".py") and not f.startswith(("test_", "action_runner", "bot", "collector", "rules", "signals", "scoring", "api"))]
 
-    print(f"[+] Python files inspected: {changed_files}")
+    print(f"[+] Python files to verify: {changed_files}")
 
-    max_time_complexity = 0.0
-    max_space_complexity = 0.0
-    combined_code = []
+    # 2. Accuracy Verification Loop
+    total_checks = 0
+    passed_checks = 0
+    syntax_valid = 1.0
 
     for file_path in changed_files:
-        if os.path.exists(file_path):
-            with open(file_path, "r", encoding="utf-8", errors="ignore") as fp:
-                content = fp.read()
-                combined_code.append(content)
-                t_order, s_order = compute_ast_complexity(content)
-                print(f"  • Scanned '{file_path}' -> Time: O(N^{int(t_order)}), Space: O(N^{int(s_order)})")
-                max_time_complexity = max(max_time_complexity, t_order)
-                max_space_complexity = max(max_space_complexity, s_order)
+        if not os.path.exists(file_path):
+            continue
 
-    # 2. Construct Fact
-    fact = {
-        "id": f"{repo_name}#{pr_number}",
-        "author": author,
-        "repo": repo_name,
-        "pr_number": pr_number,
-        "title": pr_data.get("title") or "",
-        "body": pr_data.get("body") or "",
-        "additions": pr_data.get("additions", 0),
-        "deletions": pr_data.get("deletions", 0),
-        "changed_files": pr_data.get("changed_files", 0),
-        "patch": "\n".join(combined_code)
+        # Check A: Syntax Compilation Accuracy
+        total_checks += 1
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as fp:
+            source_code = fp.read()
+
+        try:
+            compile(source_code, file_path, "exec")
+            passed_checks += 1
+            print(f"  • [PASS] Syntax compilation for '{file_path}'")
+        except Exception as e:
+            syntax_valid = 0.0
+            print(f"  • [FAIL] Syntax compilation error in '{file_path}': {e}")
+
+        # Check B: Functional Execution Accuracy (Runs standalone logic/assertions)
+        total_checks += 1
+        run_proc = subprocess.run([sys.executable, file_path], capture_output=True, text=True)
+        if run_proc.returncode == 0:
+            passed_checks += 1
+            print(f"  • [PASS] Functional runtime execution for '{file_path}'")
+        else:
+            print(f"  • [FAIL] Runtime error in '{file_path}': {run_proc.stderr.strip()[:200]}")
+
+    # Check C: Discover and Run Automated Unit Tests (pytest / unittest)
+    test_files = [f for f in os.listdir(".") if f.startswith("test_") and f.endswith(".py")]
+    for tf in test_files:
+        total_checks += 1
+        t_proc = subprocess.run([sys.executable, "-m", "unittest", tf], capture_output=True, text=True)
+        if t_proc.returncode == 0:
+            passed_checks += 1
+            print(f"  • [PASS] Test suite '{tf}' passed 100%")
+        else:
+            print(f"  • [FAIL] Test suite '{tf}' encountered failures")
+
+    # 3. Calculate Strict Accuracy Ratio
+    accuracy = (passed_checks / total_checks) if total_checks > 0 else 1.0
+    signals = {
+        "accuracy": accuracy,
+        "syntax_valid": syntax_valid,
+        "tests_passed": float(passed_checks),
+        "tests_total": float(total_checks)
     }
 
-    # 3. Extract Signals & Score
-    signals = extract_signals_for_fact(fact)
-    signals["time_complexity"] = max_time_complexity
-    signals["space_complexity"] = max_space_complexity
     score = calculate_quality_score(signals)
     signals["score"] = score
 
-    print("\n--- Evaluated PR Metrics ---")
-    print(f" • Time Complexity   : O(N^{int(signals['time_complexity'])})")
-    print(f" • Space Complexity  : O(N^{int(signals['space_complexity'])})")
-    print(f" • Diff Churn / File : {signals.get('churn_per_file', 0.0):.1f} lines")
-    print(f" • Title Entropy     : {signals.get('title_entropy', 0.0):.2f} bits")
-    print(f" • Quality Score     : {score:.4f} / 1.0000")
+    print("\n--- Final Evaluated Accuracy ---")
+    print(f" • Accuracy Percentage : {accuracy * 100.0:.2f}%")
+    print(f" • Checks Passed       : {passed_checks}/{total_checks}")
+    print(f" • Quality Score       : {score:.4f} (Required: 1.0000)")
 
-    # 4. Evaluate Rules
+    # 4. Evaluate Rules (Requires 100% Accuracy)
     rules = load_rules("rules.yaml")
     triggered_violations = []
 
@@ -109,6 +125,13 @@ async def run_ci_gate():
                 "flag": rule["action"]
             })
 
+    # Hard assert: If accuracy is not 100%, trigger violation
+    if accuracy < 1.0 and not any(v["rule_id"] == "REQUIRE_100_PERCENT_ACCURACY" for v in triggered_violations):
+        triggered_violations.append({
+            "rule_id": "REQUIRE_100_PERCENT_ACCURACY",
+            "flag": f"FLAG_INACCURATE_CODE (Accuracy: {accuracy * 100.0:.1f}% < 100.0%)"
+        })
+
     # 5. Comment on PR Thread
     if github_token:
         async with httpx.AsyncClient() as client:
@@ -124,15 +147,15 @@ async def run_ci_gate():
                 client=client
             )
 
-    # 6. CI Enforcement Decision
-    if triggered_violations:
-        print(f"\n[❌ GATE REJECTED] Found {len(triggered_violations)} violation(s):")
+    # 6. CI Gate Enforcement (100% or FAIL)
+    if accuracy < 1.0 or triggered_violations:
+        print(f"\n[❌ GATE REJECTED] Code is NOT 100% accurate ({accuracy * 100.0:.1f}%).")
         for v in triggered_violations:
-            print(f"   - {v['rule_id']} ({v['flag']})")
-        print("\nBlocking PR merge due to O(N^2)+ complexity / artificial stalls.")
+            print(f"   - {v['rule_id']}: {v['flag']}")
+        print("\nBlocking PR merge: Only 100% accurate code is approved.")
         sys.exit(1)
     else:
-        print("\n[✅ GATE PASSED] Pull request satisfies quality and efficiency baseline.")
+        print(f"\n[✅ GATE PASSED] Code verified 100% accurate. Approved for merge.")
         sys.exit(0)
 
 if __name__ == "__main__":
