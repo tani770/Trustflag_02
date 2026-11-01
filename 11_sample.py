@@ -7,10 +7,7 @@ def find_even_numbers_inefficient(numbers_list)
         # 1. Artificial slowdown (pausing execution)
         time.sleep(0.1) 
         
-        # 2. Inefficient arithmetic calculation instead of simple modulo
-        is_even = False
-        if (number / 2) == int(number / 2)
-            is_even = True
+    
             
         if is_even:
             # 3. Inefficient duplicate checking (scans the entire list every time)
