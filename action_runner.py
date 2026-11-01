@@ -2,25 +2,24 @@ import os
 import sys
 import json
 import asyncio
-from typing import Dict, Any, List
+import subprocess
 import httpx
 
-from signals import extract_signals_for_fact
+from signals import extract_signals_for_fact, compute_ast_complexity
 from scoring import calculate_quality_score
 from rules import load_rules, check_operator
 from bot import post_pr_audit_comment
 
-async def run_ci_gate() -> None:
+async def run_ci_gate():
     print("\n" + "=" * 60)
     print("TRUSTFLAG AUTONOMOUS PR AUDIT RUNNER")
     print("=" * 60)
 
-    # 1. Ingest GitHub Actions environment context
     event_path = os.getenv("GITHUB_EVENT_PATH")
     github_token = os.getenv("GITHUB_TOKEN", "").strip()
 
     if not event_path or not os.path.exists(event_path):
-        print("[!] GITHUB_EVENT_PATH not detected. Exiting safely.")
+        print("[!] No event payload found. Exiting safely.")
         sys.exit(0)
 
     with open(event_path, "r", encoding="utf-8") as f:
@@ -34,11 +33,38 @@ async def run_ci_gate() -> None:
     repo_name = event_payload["repository"]["full_name"]
     pr_number = pr_data["number"]
     author = pr_data["user"]["login"]
+    base_ref = pr_data["base"]["ref"]
 
     print(f"[*] Auditing PR #{pr_number} by @{author} on {repo_name}")
 
-    # 2. Extract immutable raw fact (Zero AST / Zero Complexity dependencies)
-    fact: Dict[str, Any] = {
+    # 1. Inspect modified Python files directly on disk
+    try:
+        changed_proc = subprocess.run(
+            ["git", "diff", "--name-only", f"origin/{base_ref}...HEAD"],
+            capture_output=True, text=True, check=True
+        )
+        changed_files = [f.strip() for f in changed_proc.stdout.splitlines() if f.strip().endswith(".py")]
+    except Exception:
+        changed_files = [f for f in os.listdir(".") if f.endswith(".py") and not f.startswith(("test_", "action_runner", "bot", "collector", "rules", "signals", "scoring", "api"))]
+
+    print(f"[+] Python files inspected: {changed_files}")
+
+    max_time_complexity = 0.0
+    max_space_complexity = 0.0
+    combined_code = []
+
+    for file_path in changed_files:
+        if os.path.exists(file_path):
+            with open(file_path, "r", encoding="utf-8", errors="ignore") as fp:
+                content = fp.read()
+                combined_code.append(content)
+                t_order, s_order = compute_ast_complexity(content)
+                print(f"  • Scanned '{file_path}' -> Time: O(N^{int(t_order)}), Space: O(N^{int(s_order)})")
+                max_time_complexity = max(max_time_complexity, t_order)
+                max_space_complexity = max(max_space_complexity, s_order)
+
+    # 2. Construct Fact
+    fact = {
         "id": f"{repo_name}#{pr_number}",
         "author": author,
         "repo": repo_name,
@@ -48,39 +74,28 @@ async def run_ci_gate() -> None:
         "additions": pr_data.get("additions", 0),
         "deletions": pr_data.get("deletions", 0),
         "changed_files": pr_data.get("changed_files", 0),
-        "created_at": pr_data.get("created_at", ""),
-        "merged_at": pr_data.get("merged_at"),
-        "is_fork_target": bool(event_payload.get("repository", {}).get("fork", False))
+        "patch": "\n".join(combined_code)
     }
 
-    # 3. Extract baseline signals & compute quality score
+    # 3. Extract Signals & Score
     signals = extract_signals_for_fact(fact)
+    signals["time_complexity"] = max_time_complexity
+    signals["space_complexity"] = max_space_complexity
     score = calculate_quality_score(signals)
     signals["score"] = score
 
-    print("\n--- PR Quality & Effort Metrics ---")
+    print("\n--- Evaluated PR Metrics ---")
+    print(f" • Time Complexity   : O(N^{int(signals['time_complexity'])})")
+    print(f" • Space Complexity  : O(N^{int(signals['space_complexity'])})")
     print(f" • Diff Churn / File : {signals.get('churn_per_file', 0.0):.1f} lines")
-    print(f" • Commit Entropy    : {signals.get('title_entropy', 0.0):.2f} bits")
-    print(f" • Body Length       : {int(signals.get('body_length', 0.0))} chars")
+    print(f" • Title Entropy     : {signals.get('title_entropy', 0.0):.2f} bits")
     print(f" • Quality Score     : {score:.4f} / 1.0000")
 
-    # 4. Evaluate single-PR gate rules
+    # 4. Evaluate Rules
     rules = load_rules("rules.yaml")
-    triggered_violations: List[Dict[str, Any]] = []
+    triggered_violations = []
 
     for rule in rules:
-        # Bypass multi-event temporal window rules (belongs to historical DB engine)
-        if rule.get("min_event_count", 1) > 1:
-            continue
-
-        # Bypass post-merge rules on open pull requests
-        if any(c["signal"] == "duration_seconds" for c in rule.get("conditions", [])) and signals.get("duration_seconds", -1.0) < 0:
-            continue
-
-        # Bypass complexity-specific rules
-        if any(c["signal"] in ["time_complexity", "space_complexity"] for c in rule.get("conditions", [])):
-            continue
-
         all_passed = True
         for cond in rule.get("conditions", []):
             sig_name = cond["signal"]
@@ -88,14 +103,13 @@ async def run_ci_gate() -> None:
             if not check_operator(val, cond["operator"], cond["threshold"]):
                 all_passed = False
                 break
-
         if all_passed:
             triggered_violations.append({
                 "rule_id": rule["id"],
                 "flag": rule["action"]
             })
 
-    # 5. Provide diagnostic comment on PR thread
+    # 5. Comment on PR Thread
     if github_token:
         async with httpx.AsyncClient() as client:
             await post_pr_audit_comment(
@@ -115,10 +129,10 @@ async def run_ci_gate() -> None:
         print(f"\n[❌ GATE REJECTED] Found {len(triggered_violations)} violation(s):")
         for v in triggered_violations:
             print(f"   - {v['rule_id']} ({v['flag']})")
-        print("\nBlocking PR merge due to quality violations.")
+        print("\nBlocking PR merge due to O(N^2)+ complexity / artificial stalls.")
         sys.exit(1)
     else:
-        print("\n[✅ GATE PASSED] Pull request satisfies quality baseline.")
+        print("\n[✅ GATE PASSED] Pull request satisfies quality and efficiency baseline.")
         sys.exit(0)
 
 if __name__ == "__main__":

@@ -41,113 +41,79 @@ def compute_duration_seconds(fact: Dict[str, Any]) -> float:
     duration = (t_merge - t_create).total_seconds()
     return max(duration, 0.0)
 
-class ComplexityVisitor(ast.NodeVisitor):
+class ComprehensiveComplexityVisitor(ast.NodeVisitor):
     def __init__(self):
-        self.current_loop_depth = 0
-        self.max_loop_depth = 0
+        self.loop_depth = 0
+        self.max_time_order = 0.0
         self.loop_allocations = 0
-        self.current_function = ""
-        self.recursive_calls = 0
-
-    def visit_FunctionDef(self, node: ast.FunctionDef):
-        old = self.current_function
-        self.current_function = node.name
-        self.generic_visit(node)
-        self.current_function = old
-
-    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef):
-        old = self.current_function
-        self.current_function = node.name
-        self.generic_visit(node)
-        self.current_function = old
+        self.has_blocking_sleep = False
+        self.hidden_linear_scans = 0
 
     def visit_For(self, node: ast.For):
-        self.current_loop_depth += 1
-        self.max_loop_depth = max(self.max_loop_depth, self.current_loop_depth)
+        self.loop_depth += 1
+        self.max_time_order = max(self.max_time_order, float(self.loop_depth))
         self.generic_visit(node)
-        self.current_loop_depth -= 1
+        self.loop_depth -= 1
 
     def visit_While(self, node: ast.While):
-        self.current_loop_depth += 1
-        self.max_loop_depth = max(self.max_loop_depth, self.current_loop_depth)
+        self.loop_depth += 1
+        self.max_time_order = max(self.max_time_order, float(self.loop_depth))
         self.generic_visit(node)
-        self.current_loop_depth -= 1
+        self.loop_depth -= 1
 
-    def visit_ListComp(self, node: ast.ListComp):
-        self.current_loop_depth += len(node.generators)
-        self.max_loop_depth = max(self.max_loop_depth, self.current_loop_depth)
-        if self.current_loop_depth > 0:
-            self.loop_allocations += 1
+    def visit_Compare(self, node: ast.Compare):
+        # DETECT HIDDEN O(N^2): 'in' or 'not in' list lookup INSIDE a loop
+        if self.loop_depth > 0:
+            for op in node.ops:
+                if isinstance(op, (ast.In, ast.NotIn)):
+                    self.hidden_linear_scans += 1
+                    # A linear scan inside a loop compounds the complexity to O(N^2)
+                    self.max_time_order = max(self.max_time_order, float(self.loop_depth + 1))
         self.generic_visit(node)
-        self.current_loop_depth -= len(node.generators)
 
     def visit_Call(self, node: ast.Call):
-        if isinstance(node.func, ast.Name) and node.func.id == self.current_function:
-            self.recursive_calls += 1
+        # DETECT ARTIFICIAL STALLS: time.sleep() inside a loop
+        if self.loop_depth > 0:
+            # Matches time.sleep(...) or sleep(...)
+            if isinstance(node.func, ast.Attribute) and node.func.attr == "sleep":
+                self.has_blocking_sleep = True
+                self.max_time_order = max(self.max_time_order, 2.0)
+            elif isinstance(node.func, ast.Name) and node.func.id == "sleep":
+                self.has_blocking_sleep = True
+                self.max_time_order = max(self.max_time_order, 2.0)
         self.generic_visit(node)
 
     def visit_List(self, node: ast.List):
-        if self.current_loop_depth > 0:
-            self.loop_allocations += 1
-        self.generic_visit(node)
-
-    def visit_Dict(self, node: ast.Dict):
-        if self.current_loop_depth > 0:
+        if self.loop_depth > 0:
             self.loop_allocations += 1
         self.generic_visit(node)
 
 def compute_ast_complexity(code_str: str) -> Tuple[float, float]:
-    """Analyzes a Python string (or git patch) and returns (time_order, space_order)."""
     if not code_str or not code_str.strip():
         return 0.0, 0.0
 
-    # 1. Cleanly strip git diff metadata if diff headers exist
-    code_lines = []
-    has_diff_headers = any(line.strip().startswith(("@@", "diff --git", "--- ", "+++ ")) for line in code_str.splitlines())
-
-    for raw_line in code_str.splitlines():
-        line = raw_line.strip()
-        if line.startswith(("@@", "diff --git", "---", "+++", "index ")):
-            continue
-        if has_diff_headers:
-            if raw_line.startswith("+"):
-                code_lines.append(raw_line[1:])
-        else:
-            code_lines.append(raw_line)
-
-    clean_code = "\n".join(code_lines).strip()
-    if not clean_code:
-        return 0.0, 0.0
-
-    # 2. Parse AST (with indentation wrapper fallback)
     try:
-        tree = ast.parse(clean_code)
+        tree = ast.parse(code_str)
     except SyntaxError:
         try:
-            wrapped = "def _scope_wrapper():\n" + "\n".join(f"    {l}" for l in clean_code.splitlines())
+            wrapped = "def _scope_wrapper():\n" + "\n".join(f"    {l}" for l in code_str.splitlines())
             tree = ast.parse(wrapped)
         except SyntaxError:
             return 0.0, 0.0
 
-    v = ComplexityVisitor()
-    v.visit(tree)
-    time_order = float(v.max_loop_depth)
-    if v.recursive_calls > 0:
-        time_order = max(time_order, 2.5)
-    space_order = float(min(v.loop_allocations, 2.0))
-    return round(time_order, 2), round(space_order, 2)
-
-# Alias for backward-compatibility with PR facts
-def compute_code_complexity(fact: Dict[str, Any]) -> Tuple[float, float]:
-    patch = fact.get("patch") or fact.get("body") or ""
-    return compute_ast_complexity(patch)
+    visitor = ComprehensiveComplexityVisitor()
+    visitor.visit(tree)
+    space_order = float(min(visitor.loop_allocations, 2.0))
+    return round(visitor.max_time_order, 2), round(space_order, 2)
 
 def compute_time_complexity(fact: Dict[str, Any]) -> float:
-    time_order, _ = compute_code_complexity(fact)
+    patch = fact.get("patch") or fact.get("body") or ""
+    time_order, _ = compute_ast_complexity(patch)
     return time_order
 
 def compute_space_complexity(fact: Dict[str, Any]) -> float:
-    _, space_order = compute_code_complexity(fact)
+    patch = fact.get("patch") or fact.get("body") or ""
+    _, space_order = compute_ast_complexity(patch)
     return space_order
 
 SIGNAL_REGISTRY = {
